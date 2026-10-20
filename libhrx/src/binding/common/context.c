@@ -19,151 +19,156 @@
 #include "common/memory.h"
 #include "common/stream.h"
 #include "common/stream_value.h"
+#include "iree/base/internal/atomics.h"
 #include "libhrx/src/libhrx/mem_pool_backing.h"
 
 // Defined by the AMDGPU HAL driver when it is linked (aql_block_processor.h).
 __attribute__((weak)) void iree_hal_amdgpu_acquire_elision_note_foreign_writer(
-    const char* reason);
+    const char* reason, bool tracked);
 __attribute__((weak)) int iree_hal_amdgpu_acquire_elision_mode(void);
 
 //===----------------------------------------------------------------------===//
 // NC ledger
 //===----------------------------------------------------------------------===//
 
-#define IREE_HAL_STREAMING_NC_LEDGER_CAPACITY 256
+// Pointer tables are small; larger host-to-device copies are bulk data and are
+// not scanned.
+#define IREE_HAL_STREAMING_NC_INDIRECT_SCAN_LIMIT (64 * 1024)
 #define IREE_HAL_STREAMING_NC_REPORT_CAPACITY 64
 
-// Append-only with tombstones: readers scan without the lock.
 static struct {
-  iree_slim_mutex_t mutex;
-  uint32_t count;
-  uint64_t lowest;
-  uint64_t highest;
-  struct {
-    uint64_t base;
-    uint64_t end;
-  } ranges[IREE_HAL_STREAMING_NC_LEDGER_CAPACITY];
+  // NULL while acquire elision is off.
+  iree_hal_streaming_nc_ledger_t* ledger;
+  bool report;
+  iree_slim_mutex_t report_mutex;
   // Kernels already reported as retaining an acquire.
-  uint32_t reported_count;
+  iree_host_size_t reported_count;
   uint64_t reported_hashes[IREE_HAL_STREAMING_NC_REPORT_CAPACITY];
-  uint64_t retained_count;
-} iree_hal_streaming_nc_ledger;
-static pthread_once_t iree_hal_streaming_nc_ledger_once = PTHREAD_ONCE_INIT;
+  iree_atomic_int64_t retained_count;
+} iree_hal_streaming_nc_memory;
+static pthread_once_t iree_hal_streaming_nc_memory_once = PTHREAD_ONCE_INIT;
 
-static void iree_hal_streaming_nc_ledger_initialize(void) {
-  iree_slim_mutex_initialize(&iree_hal_streaming_nc_ledger.mutex);
-  iree_hal_streaming_nc_ledger.lowest = UINT64_MAX;
+void iree_hal_streaming_nc_memory_note_foreign_writer(const char* reason,
+                                                      bool tracked) {
+  if (iree_hal_amdgpu_acquire_elision_note_foreign_writer) {
+    iree_hal_amdgpu_acquire_elision_note_foreign_writer(reason, tracked);
+  }
 }
 
-void iree_hal_streaming_nc_ledger_add(uint64_t base, uint64_t size) {
-  pthread_once(&iree_hal_streaming_nc_ledger_once,
-               iree_hal_streaming_nc_ledger_initialize);
-  iree_slim_mutex_lock(&iree_hal_streaming_nc_ledger.mutex);
-  const uint32_t index = iree_hal_streaming_nc_ledger.count;
-  if (index < IREE_HAL_STREAMING_NC_LEDGER_CAPACITY) {
-    iree_hal_streaming_nc_ledger.ranges[index].base = base;
-    iree_hal_streaming_nc_ledger.ranges[index].end = base + size;
-    if (base < iree_hal_streaming_nc_ledger.lowest) {
-      __atomic_store_n(&iree_hal_streaming_nc_ledger.lowest, base,
-                       __ATOMIC_RELAXED);
-    }
-    if (base + size > iree_hal_streaming_nc_ledger.highest) {
-      __atomic_store_n(&iree_hal_streaming_nc_ledger.highest, base + size,
-                       __ATOMIC_RELAXED);
-    }
-    __atomic_store_n(&iree_hal_streaming_nc_ledger.count, index + 1,
-                     __ATOMIC_RELEASE);
-  } else {
-    // Overflow: cover everything rather than miss a range.
-    __atomic_store_n(&iree_hal_streaming_nc_ledger.lowest, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&iree_hal_streaming_nc_ledger.highest, UINT64_MAX,
-                     __ATOMIC_RELAXED);
+static void iree_hal_streaming_nc_memory_initialize(void) {
+  if (!iree_hal_amdgpu_acquire_elision_mode ||
+      iree_hal_amdgpu_acquire_elision_mode() == 0) {
+    return;
   }
-  iree_slim_mutex_unlock(&iree_hal_streaming_nc_ledger.mutex);
+  const char* report = getenv("HRX_ELIDE_ACQUIRE_REPORT");
+  iree_hal_streaming_nc_memory.report = report && report[0] && report[0] != '0';
+  iree_slim_mutex_initialize(&iree_hal_streaming_nc_memory.report_mutex);
+  iree_status_t status = iree_hal_streaming_nc_ledger_create(
+      iree_allocator_system(), &iree_hal_streaming_nc_memory.ledger);
+  if (!iree_status_is_ok(status)) {
+    iree_status_ignore(status);
+    iree_hal_streaming_nc_memory_note_foreign_writer("nc ledger unavailable",
+                                                     /*tracked=*/false);
+  }
 }
 
-void iree_hal_streaming_nc_ledger_remove(uint64_t base) {
-  pthread_once(&iree_hal_streaming_nc_ledger_once,
-               iree_hal_streaming_nc_ledger_initialize);
-  iree_slim_mutex_lock(&iree_hal_streaming_nc_ledger.mutex);
-  for (uint32_t i = 0; i < iree_hal_streaming_nc_ledger.count; ++i) {
-    if (iree_hal_streaming_nc_ledger.ranges[i].base == base) {
-      __atomic_store_n(&iree_hal_streaming_nc_ledger.ranges[i].end, base,
-                       __ATOMIC_RELAXED);
-    }
-  }
-  iree_slim_mutex_unlock(&iree_hal_streaming_nc_ledger.mutex);
+static iree_hal_streaming_nc_ledger_t* iree_hal_streaming_nc_memory_ledger(
+    void) {
+  pthread_once(&iree_hal_streaming_nc_memory_once,
+               iree_hal_streaming_nc_memory_initialize);
+  return iree_hal_streaming_nc_memory.ledger;
 }
 
-static bool iree_hal_streaming_nc_ledger_references(
-    iree_const_byte_span_t kernargs) {
-  const uint32_t count = __atomic_load_n(&iree_hal_streaming_nc_ledger.count,
-                                         __ATOMIC_ACQUIRE);
-  const uint64_t lowest = __atomic_load_n(&iree_hal_streaming_nc_ledger.lowest,
-                                          __ATOMIC_RELAXED);
-  const uint64_t highest = __atomic_load_n(
-      &iree_hal_streaming_nc_ledger.highest, __ATOMIC_RELAXED);
-  if (lowest >= highest) return false;
-  const iree_host_size_t word_count = kernargs.data_length / sizeof(uint64_t);
-  for (iree_host_size_t i = 0; i < word_count; ++i) {
-    uint64_t value = 0;
-    memcpy(&value, kernargs.data + i * sizeof(uint64_t), sizeof(value));
-    if (value < lowest || value >= highest) continue;
-    if (count >= IREE_HAL_STREAMING_NC_LEDGER_CAPACITY) return true;
-    for (uint32_t j = 0; j < count; ++j) {
-      if (value >= iree_hal_streaming_nc_ledger.ranges[j].base &&
-          value < __atomic_load_n(&iree_hal_streaming_nc_ledger.ranges[j].end,
-                                  __ATOMIC_RELAXED)) {
-        return true;
-      }
-    }
+void iree_hal_streaming_nc_memory_track(
+    uint64_t base, uint64_t size, iree_hal_streaming_nc_range_kind_t kind) {
+  iree_hal_streaming_nc_ledger_t* ledger =
+      iree_hal_streaming_nc_memory_ledger();
+  if (!ledger) {
+    return;
   }
-  return false;
+  iree_status_t status =
+      iree_hal_streaming_nc_ledger_insert(ledger, base, size, kind);
+  if (!iree_status_is_ok(status)) {
+    iree_status_ignore(status);
+    iree_hal_streaming_nc_memory_note_foreign_writer("nc ledger insert failed",
+                                                     /*tracked=*/false);
+  }
 }
 
-static void iree_hal_streaming_nc_ledger_report(iree_string_view_t name) {
-  static int report = -1;
-  if (report < 0) {
-    const char* value = getenv("HRX_ELIDE_ACQUIRE_REPORT");
-    report = value && value[0] && value[0] != '0';
+void iree_hal_streaming_nc_memory_untrack(uint64_t base) {
+  iree_hal_streaming_nc_ledger_t* ledger =
+      iree_hal_streaming_nc_memory_ledger();
+  if (ledger) {
+    iree_hal_streaming_nc_ledger_remove(ledger, base);
   }
-  const uint64_t retained = __atomic_add_fetch(
-      &iree_hal_streaming_nc_ledger.retained_count, 1, __ATOMIC_RELAXED);
-  if (!report) return;
+}
+
+void iree_hal_streaming_nc_memory_note_host_to_device_copy(uint64_t dst,
+                                                           const void* src,
+                                                           uint64_t size) {
+  iree_hal_streaming_nc_ledger_t* ledger =
+      iree_hal_streaming_nc_memory_ledger();
+  if (!ledger || !src || size < sizeof(uint64_t) ||
+      size > IREE_HAL_STREAMING_NC_INDIRECT_SCAN_LIMIT) {
+    return;
+  }
+  if (iree_hal_streaming_nc_ledger_scan(
+          ledger, iree_make_const_byte_span(src, (iree_host_size_t)size),
+          /*out_kind=*/NULL)) {
+    iree_hal_streaming_nc_memory_track(
+        dst, size, IREE_HAL_STREAMING_NC_RANGE_KIND_INDIRECT);
+  }
+}
+
+static void iree_hal_streaming_nc_memory_report(
+    iree_string_view_t name, iree_hal_streaming_nc_range_kind_t kind) {
+  const int64_t retained =
+      iree_atomic_fetch_add(&iree_hal_streaming_nc_memory.retained_count, 1,
+                            iree_memory_order_relaxed) +
+      1;
+  if (!iree_hal_streaming_nc_memory.report) {
+    return;
+  }
   uint64_t hash = 1469598103934665603ull;
   for (iree_host_size_t i = 0; i < name.size; ++i) {
     hash = (hash ^ (uint8_t)name.data[i]) * 1099511628211ull;
   }
-  iree_slim_mutex_lock(&iree_hal_streaming_nc_ledger.mutex);
+  hash ^= (uint64_t)kind;
+  iree_slim_mutex_lock(&iree_hal_streaming_nc_memory.report_mutex);
   bool seen = false;
-  for (uint32_t i = 0; i < iree_hal_streaming_nc_ledger.reported_count; ++i) {
-    seen |= iree_hal_streaming_nc_ledger.reported_hashes[i] == hash;
+  for (iree_host_size_t i = 0; i < iree_hal_streaming_nc_memory.reported_count;
+       ++i) {
+    seen |= iree_hal_streaming_nc_memory.reported_hashes[i] == hash;
   }
-  if (!seen && iree_hal_streaming_nc_ledger.reported_count <
+  if (!seen && iree_hal_streaming_nc_memory.reported_count <
                    IREE_HAL_STREAMING_NC_REPORT_CAPACITY) {
-    iree_hal_streaming_nc_ledger
-        .reported_hashes[iree_hal_streaming_nc_ledger.reported_count++] = hash;
+    iree_hal_streaming_nc_memory
+        .reported_hashes[iree_hal_streaming_nc_memory.reported_count++] = hash;
   }
-  iree_slim_mutex_unlock(&iree_hal_streaming_nc_ledger.mutex);
+  iree_slim_mutex_unlock(&iree_hal_streaming_nc_memory.report_mutex);
   if (!seen) {
     fprintf(stderr,
-            "[hrx-elide] pid=%d keep-acquire kernel=%.*s (retained so far "
-            "%" PRIu64 ")\n",
-            (int)getpid(), (int)name.size, name.data, retained);
+            "[hrx-elide] pid=%d keep-acquire kernel=%.*s via=%s (retained so "
+            "far %" PRId64 ")\n",
+            (int)getpid(), (int)name.size, name.data,
+            iree_hal_streaming_nc_range_kind_name(kind), retained);
   }
 }
 
 iree_status_t iree_hal_streaming_record_nc_acquire_if_needed(
     iree_hal_command_buffer_t* command_buffer, iree_const_byte_span_t kernargs,
     iree_string_view_t kernel_name) {
-  if (!iree_hal_amdgpu_acquire_elision_mode ||
-      iree_hal_amdgpu_acquire_elision_mode() != 2) {
+  iree_hal_streaming_nc_ledger_t* ledger =
+      iree_hal_streaming_nc_memory_ledger();
+  if (!ledger) {
     return iree_ok_status();
   }
-  if (!iree_hal_streaming_nc_ledger_references(kernargs)) {
+  iree_hal_streaming_nc_range_kind_t kind =
+      IREE_HAL_STREAMING_NC_RANGE_KIND_IPC_IMPORT;
+  if (!iree_hal_streaming_nc_ledger_scan(ledger, kernargs, &kind)) {
     return iree_ok_status();
   }
-  iree_hal_streaming_nc_ledger_report(kernel_name);
+  iree_hal_streaming_nc_memory_report(kernel_name, kind);
   static const iree_hal_memory_barrier_t memory_barrier = {
       .target_scope = IREE_HAL_ACCESS_SCOPE_DISPATCH_READ |
                       IREE_HAL_ACCESS_SCOPE_DISPATCH_WRITE |
@@ -803,9 +808,8 @@ iree_status_t iree_hal_streaming_context_enable_peer_access(
   context->peer_contexts[context->peer_count++] = peer_context;
 
   iree_slim_mutex_unlock(&context->mutex);
-  if (iree_hal_amdgpu_acquire_elision_note_foreign_writer) {
-    iree_hal_amdgpu_acquire_elision_note_foreign_writer("peer access");
-  }
+  iree_hal_streaming_nc_memory_note_foreign_writer("peer access",
+                                                   /*tracked=*/false);
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
 }

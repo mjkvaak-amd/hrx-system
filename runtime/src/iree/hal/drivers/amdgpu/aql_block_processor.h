@@ -147,12 +147,14 @@ iree_status_t iree_hal_amdgpu_aql_block_processor_invoke(
 typedef enum iree_hal_amdgpu_acquire_elision_mode_e {
   // Every recorded acquire is emitted.
   IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_OFF = 0,
-  // Interior agent acquires are elided until the process gains a foreign
-  // writer (peer access or an IPC import) or local VRAM is not mapped RW.
+  // Interior agent acquires are elided until the process gains another GPU
+  // as a writer (peer access or an IPC import), and never when local VRAM is
+  // not mapped RW. Callers must still record a system-scope acquire on every
+  // dispatch that can reach CPU-written NC memory (host memory on gfx950).
   IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_PROCESS = 1,
-  // Interior agent acquires are elided regardless of foreign writers. Callers
-  // must record a system-scope acquire on every dispatch that can observe
-  // foreign NC writes; system-scope acquires are never elided.
+  // Interior agent acquires are elided while every foreign writer is tracked.
+  // Callers must record a system-scope acquire on every dispatch that can
+  // observe tracked foreign NC writes; system-scope acquires are never elided.
   IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_DISPATCH = 2,
 } iree_hal_amdgpu_acquire_elision_mode_t;
 
@@ -161,8 +163,11 @@ iree_hal_amdgpu_acquire_elision_mode_t iree_hal_amdgpu_acquire_elision_mode(
     void);
 
 // Records that another agent may now write memory this process maps NC.
-// Permanently disables PROCESS-mode elision. |reason| must be a literal.
-void iree_hal_amdgpu_acquire_elision_note_foreign_writer(const char* reason);
+// Permanently disables PROCESS-mode elision, and DISPATCH-mode elision too
+// unless |tracked| (the caller acquires before every dispatch that can reach
+// that memory). |reason| must be a literal.
+void iree_hal_amdgpu_acquire_elision_note_foreign_writer(const char* reason,
+                                                         bool tracked);
 
 #ifdef __cplusplus
 }  // extern "C"

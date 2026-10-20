@@ -1858,6 +1858,25 @@ iree_status_t iree_hal_streaming_memory_discard_unpublished_device(
       ref.buffer, /*trim_to_release_threshold=*/true);
 }
 
+// gfx950 maps host memory MTYPE_NC and the CPU writes it.
+static void iree_hal_streaming_memory_track_host_buffer(
+    const iree_hal_streaming_buffer_t* buffer) {
+  iree_hal_streaming_nc_memory_track((uint64_t)(uintptr_t)buffer->host_ptr,
+                                     buffer->size,
+                                     IREE_HAL_STREAMING_NC_RANGE_KIND_HOST);
+  if (buffer->device_ptr != (uint64_t)(uintptr_t)buffer->host_ptr) {
+    iree_hal_streaming_nc_memory_track(buffer->device_ptr, buffer->size,
+                                       IREE_HAL_STREAMING_NC_RANGE_KIND_HOST);
+  }
+}
+
+// Also drops INDIRECT ranges that start at a freed device allocation.
+static void iree_hal_streaming_memory_untrack_buffer(
+    const iree_hal_streaming_buffer_t* buffer) {
+  iree_hal_streaming_nc_memory_untrack((uint64_t)(uintptr_t)buffer->host_ptr);
+  iree_hal_streaming_nc_memory_untrack(buffer->device_ptr);
+}
+
 iree_status_t iree_hal_streaming_memory_free_device(
     iree_hal_streaming_context_t* context, iree_hal_streaming_deviceptr_t ptr) {
   if (!ptr) {
@@ -1885,6 +1904,7 @@ iree_status_t iree_hal_streaming_memory_free_device(
     return status;
   }
   hrx_buffer_table_cancel_reserved_insert(&owner_context->buffer_table);
+  iree_hal_streaming_memory_untrack_buffer(wrapper);
 
   // A HIP pointer may be hidden in native kernargs or device memory, so freeing
   // cannot rely on launch-time binding discovery. The synchronization above
@@ -2116,6 +2136,7 @@ iree_status_t iree_hal_streaming_memory_free_device_async(
                                               IREE_HAL_HOST_CALL_FLAG_NONE);
   if (iree_status_is_ok(status)) {
     hrx_buffer_table_cancel_reserved_insert(&owner_context->buffer_table);
+    iree_hal_streaming_memory_untrack_buffer(wrapper);
     // The allocation is now unavailable to future streams. A later allocation
     // on this stream may adopt its backing before the callback completes.
     iree_hal_streaming_buffer_release_pool_allocation(wrapper);
@@ -2297,10 +2318,13 @@ iree_status_t iree_hal_streaming_memory_allocate_host(
     iree_hal_streaming_context_t* context, iree_host_size_t size,
     iree_hal_streaming_host_register_flags_t flags,
     iree_hal_streaming_buffer_t** out_buffer) {
-  return iree_hal_streaming_memory_allocate_owned_host_import_with_context_mode(
-      context, size, flags, IREE_HAL_BUFFER_USAGE_DEFAULT,
-      /*min_alignment=*/64, IREE_HAL_STREAMING_BUFFER_CONTEXT_RETAINED,
-      out_buffer);
+  IREE_RETURN_IF_ERROR(
+      iree_hal_streaming_memory_allocate_owned_host_import_with_context_mode(
+          context, size, flags, IREE_HAL_BUFFER_USAGE_DEFAULT,
+          /*min_alignment=*/64, IREE_HAL_STREAMING_BUFFER_CONTEXT_RETAINED,
+          out_buffer));
+  iree_hal_streaming_memory_track_host_buffer(*out_buffer);
+  return iree_ok_status();
 }
 
 iree_status_t iree_hal_streaming_memory_allocate_host_staging(
@@ -2412,6 +2436,7 @@ iree_status_t iree_hal_streaming_memory_allocate_managed(
     IREE_TRACE_ZONE_END(z0);
     return status;
   }
+  iree_hal_streaming_memory_track_host_buffer(buffer);
   *out_buffer = buffer;
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
@@ -2496,6 +2521,7 @@ iree_status_t iree_hal_streaming_memory_free_host(
     return status;
   }
   hrx_buffer_table_cancel_reserved_insert(&owner_context->buffer_table);
+  iree_hal_streaming_memory_untrack_buffer(wrapper);
 
   // Free wrapper and release its context ownership edge.
   iree_hal_streaming_buffer_free(wrapper);
@@ -2553,6 +2579,7 @@ static iree_status_t iree_hal_streaming_memory_register_host_with_context_mode(
   if (iree_status_is_ok(status)) {
     wrapper->is_managed = is_managed;
     wrapper->host_register_flags = flags;
+    iree_hal_streaming_memory_track_host_buffer(wrapper);
     *out_buffer = wrapper;
   } else {
     if (wrapper) {
@@ -2615,6 +2642,7 @@ iree_status_t iree_hal_streaming_memory_unregister_host(
     return status;
   }
   hrx_buffer_table_cancel_reserved_insert(&owner_context->buffer_table);
+  iree_hal_streaming_memory_untrack_buffer(wrapper);
 
   // A captured graph may still retain this HAL import. Removing the public
   // registration prevents new lookups while the HAL refcount keeps the pages
@@ -3297,6 +3325,8 @@ iree_status_t iree_hal_streaming_memcpy_host_to_device(
   IREE_ASSERT_ARGUMENT(dst);
   IREE_ASSERT_ARGUMENT(src);
   IREE_TRACE_ZONE_BEGIN(z0);
+
+  iree_hal_streaming_nc_memory_note_host_to_device_copy(dst, src, size);
 
   if (stream) {
     iree_hal_streaming_capture_host_to_device_t capture = {

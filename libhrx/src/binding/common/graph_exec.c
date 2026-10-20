@@ -1699,7 +1699,9 @@ static iree_status_t iree_hal_streaming_graph_record_partition(
                 : IREE_HAL_DISPATCH_FLAG_NONE;
         status = iree_hal_streaming_record_nc_acquire_if_needed(
             command_buffer, attrs->constants, symbol->name);
-        if (!iree_status_is_ok(status)) break;
+        if (!iree_status_is_ok(status)) {
+          break;
+        }
         status = iree_hal_command_buffer_dispatch(
             command_buffer, symbol->executable,
             iree_hal_executable_function_from_index(symbol->export_ordinal),

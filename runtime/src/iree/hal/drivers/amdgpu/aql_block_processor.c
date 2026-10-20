@@ -131,6 +131,12 @@ static struct {
   // Set once; PROCESS mode stops eliding after the first foreign writer.
   int foreign_writer;
   const char* foreign_writer_reason;
+  // Set once; DISPATCH mode stops eliding after the first foreign writer whose
+  // memory the binding cannot track.
+  int untracked_foreign_writer;
+  const char* untracked_foreign_writer_reason;
+  // Distinct reasons already logged.
+  const char* logged_reasons[8];
   uint64_t elided_count;
   uint64_t kept_count;
 } iree_hal_amdgpu_acquire_elision_state = {
@@ -139,9 +145,13 @@ static struct {
 
 static int iree_hal_amdgpu_acquire_elision_read_mtype_local(void) {
   FILE* file = fopen("/sys/module/amdgpu/parameters/mtype_local", "r");
-  if (!file) return 0;
+  if (!file) {
+    return 0;
+  }
   int value = 0;
-  if (fscanf(file, "%d", &value) != 1) value = 0;
+  if (fscanf(file, "%d", &value) != 1) {
+    value = 0;
+  }
   fclose(file);
   return value;
 }
@@ -149,7 +159,7 @@ static int iree_hal_amdgpu_acquire_elision_read_mtype_local(void) {
 static void iree_hal_amdgpu_acquire_elision_print_report(void) {
   fprintf(stderr,
           "[hrx-elide] pid=%d mode=%d elided=%" PRIu64 " kept=%" PRIu64
-          " foreign_writer=%s\n",
+          " foreign_writer=%s untracked=%s\n",
           (int)getpid(), (int)iree_hal_amdgpu_acquire_elision_state.mode,
           __atomic_load_n(&iree_hal_amdgpu_acquire_elision_state.elided_count,
                           __ATOMIC_RELAXED),
@@ -157,19 +167,27 @@ static void iree_hal_amdgpu_acquire_elision_print_report(void) {
                           __ATOMIC_RELAXED),
           iree_hal_amdgpu_acquire_elision_state.foreign_writer_reason
               ? iree_hal_amdgpu_acquire_elision_state.foreign_writer_reason
+              : "none",
+          iree_hal_amdgpu_acquire_elision_state.untracked_foreign_writer_reason
+              ? iree_hal_amdgpu_acquire_elision_state
+                    .untracked_foreign_writer_reason
               : "none");
 }
 
 static void iree_hal_amdgpu_acquire_elision_initialize(void) {
   const char* value = getenv("HRX_ELIDE_ACQUIRE");
-  if (!value || !value[0]) value = getenv("HRX_ELIDE_DISPATCH_ACQUIRE");
+  if (!value || !value[0]) {
+    value = getenv("HRX_ELIDE_DISPATCH_ACQUIRE");
+  }
   int mode = value && value[0] ? atoi(value) : 0;
   if (mode < 0 || mode > IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_DISPATCH) {
     mode = IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_OFF;
   }
   iree_hal_amdgpu_acquire_elision_state.mode =
       (iree_hal_amdgpu_acquire_elision_mode_t)mode;
-  if (mode == IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_OFF) return;
+  if (mode == IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_OFF) {
+    return;
+  }
   if (iree_hal_amdgpu_acquire_elision_read_mtype_local() != 0) {
     // Local VRAM is NC or CC: every interior acquire may be load-bearing.
     iree_hal_amdgpu_acquire_elision_state.mode =
@@ -192,7 +210,8 @@ iree_hal_amdgpu_acquire_elision_mode_t iree_hal_amdgpu_acquire_elision_mode(
   return iree_hal_amdgpu_acquire_elision_state.mode;
 }
 
-void iree_hal_amdgpu_acquire_elision_note_foreign_writer(const char* reason) {
+void iree_hal_amdgpu_acquire_elision_note_foreign_writer(const char* reason,
+                                                         bool tracked) {
   if (iree_hal_amdgpu_acquire_elision_mode() ==
       IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_OFF) {
     return;
@@ -200,9 +219,30 @@ void iree_hal_amdgpu_acquire_elision_note_foreign_writer(const char* reason) {
   if (__atomic_exchange_n(&iree_hal_amdgpu_acquire_elision_state.foreign_writer,
                           1, __ATOMIC_SEQ_CST) == 0) {
     iree_hal_amdgpu_acquire_elision_state.foreign_writer_reason = reason;
-    if (iree_hal_amdgpu_acquire_elision_state.report) {
-      fprintf(stderr, "[hrx-elide] pid=%d foreign writer: %s\n", (int)getpid(),
-              reason);
+  }
+  if (!tracked &&
+      __atomic_exchange_n(
+          &iree_hal_amdgpu_acquire_elision_state.untracked_foreign_writer, 1,
+          __ATOMIC_SEQ_CST) == 0) {
+    iree_hal_amdgpu_acquire_elision_state.untracked_foreign_writer_reason =
+        reason;
+  }
+  if (!iree_hal_amdgpu_acquire_elision_state.report) {
+    return;
+  }
+  for (size_t i = 0;
+       i < IREE_ARRAYSIZE(iree_hal_amdgpu_acquire_elision_state.logged_reasons);
+       ++i) {
+    const char* expected = NULL;
+    if (__atomic_compare_exchange_n(
+            &iree_hal_amdgpu_acquire_elision_state.logged_reasons[i], &expected,
+            reason, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+      fprintf(stderr, "[hrx-elide] pid=%d foreign writer: %s (%s)\n",
+              (int)getpid(), reason, tracked ? "tracked" : "untracked");
+      return;
+    }
+    if (expected == reason) {
+      return;
     }
   }
 }
@@ -212,11 +252,17 @@ void iree_hal_amdgpu_acquire_elision_note_foreign_writer(const char* reason) {
 static bool iree_hal_amdgpu_aql_block_processor_elide_agent_acquire(void) {
   const iree_hal_amdgpu_acquire_elision_mode_t mode =
       iree_hal_amdgpu_acquire_elision_mode();
-  if (mode == IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_OFF) return false;
+  if (mode == IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_OFF) {
+    return false;
+  }
   const bool elide =
-      mode == IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_DISPATCH ||
-      !__atomic_load_n(&iree_hal_amdgpu_acquire_elision_state.foreign_writer,
-                       __ATOMIC_ACQUIRE);
+      mode == IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_DISPATCH
+          ? !__atomic_load_n(
+                &iree_hal_amdgpu_acquire_elision_state.untracked_foreign_writer,
+                __ATOMIC_ACQUIRE)
+          : !__atomic_load_n(
+                &iree_hal_amdgpu_acquire_elision_state.foreign_writer,
+                __ATOMIC_ACQUIRE);
   if (iree_hal_amdgpu_acquire_elision_state.report) {
     const uint64_t count = __atomic_add_fetch(
         elide ? &iree_hal_amdgpu_acquire_elision_state.elided_count
