@@ -11455,10 +11455,6 @@ typedef struct {
   void* mapped_base;
 } iree_hip_ipc_import_t;
 
-// Defined by the AMDGPU HAL driver when it is linked (aql_block_processor.h).
-__attribute__((weak)) void iree_hal_amdgpu_acquire_elision_note_foreign_writer(
-    const char* reason);
-
 static iree_hip_ipc_rocr_t iree_hip_ipc_rocr;
 static pthread_once_t iree_hip_ipc_rocr_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t iree_hip_ipc_imports_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -11605,11 +11601,11 @@ HIPAPI hipError_t hipIpcOpenMemHandle(void** devPtr, hipIpcMemHandle_t handle,
   iree_hip_ipc_imports[iree_hip_ipc_import_count++] =
       (iree_hip_ipc_import_t){user_ptr, mapped};
   pthread_mutex_unlock(&iree_hip_ipc_imports_mutex);
-  iree_hal_streaming_nc_ledger_add((uint64_t)(uintptr_t)mapped,
-                                   wire.allocation_size);
-  if (iree_hal_amdgpu_acquire_elision_note_foreign_writer) {
-    iree_hal_amdgpu_acquire_elision_note_foreign_writer("ipc import");
-  }
+  iree_hal_streaming_nc_memory_track(
+      (uint64_t)(uintptr_t)mapped, wire.allocation_size,
+      IREE_HAL_STREAMING_NC_RANGE_KIND_IPC_IMPORT);
+  iree_hal_streaming_nc_memory_note_foreign_writer("ipc import",
+                                                   /*tracked=*/true);
   *devPtr = user_ptr;
   HIP_RETURN_ERROR(hipSuccess);
 }
@@ -11641,7 +11637,7 @@ HIPAPI hipError_t hipIpcCloseMemHandle(void* devPtr) {
   }
   // Work that reads the mapping may still be in flight.
   result = hipDeviceSynchronize();
-  iree_hal_streaming_nc_ledger_remove((uint64_t)(uintptr_t)mapped);
+  iree_hal_streaming_nc_memory_untrack((uint64_t)(uintptr_t)mapped);
   if (rocr->ipc_detach(mapped) != IREE_HIP_HSA_STATUS_SUCCESS &&
       result == hipSuccess) {
     result = hipErrorInvalidValue;

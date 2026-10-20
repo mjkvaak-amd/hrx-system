@@ -60,6 +60,18 @@ hrx_cc_library(
 )
 
 hrx_cc_library(
+    name = "nc_ledger",
+    srcs = ["nc_ledger.c"],
+    hdrs = ["nc_ledger.h"],
+    includes = [".."],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/base/threading",
+    ],
+)
+
+hrx_cc_library(
     name = "function_attributes",
     srcs = ["function_attributes.c"],
     hdrs = ["function_attributes.h"],
@@ -134,6 +146,7 @@ hrx_cc_library(
         ":capture_admission",
         ":execution_resource",
         ":function_attributes",
+        ":nc_ledger",
         "//build_tools/bazel:pthreads",
         "//libhrx/src/libhrx:hrx_static",
         "//runtime/src/iree/async",
@@ -146,6 +159,16 @@ hrx_cc_library(
         "//runtime/src/iree/hal/utils:resource_set",
         "//runtime/src/iree/io:file_handle",
         "//third_party:zstd",
+    ],
+)
+
+hrx_cc_test(
+    name = "nc_ledger_test",
+    srcs = ["nc_ledger_test.cc"],
+    deps = [
+        ":nc_ledger",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
     ],
 )
 

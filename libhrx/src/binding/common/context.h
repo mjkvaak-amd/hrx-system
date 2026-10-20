@@ -11,6 +11,7 @@
 #include "common/capture_admission.h"
 #include "common/event.h"
 #include "common/event_timestamp_pool.h"
+#include "common/nc_ledger.h"
 #include "common/registry.h"
 #include "iree/base/api.h"
 #include "iree/base/threading/mutex.h"
@@ -308,21 +309,36 @@ iree_status_t iree_hal_streaming_context_disable_peer_access(
     iree_hal_streaming_context_t* peer_context);
 
 //===----------------------------------------------------------------------===//
-// NC ledger (HRX_ELIDE_ACQUIRE=2)
+// NC ledger (HRX_ELIDE_ACQUIRE=1,2)
 //===----------------------------------------------------------------------===//
 
-// Process-wide set of device address ranges that this process maps MTYPE_NC
-// and that another agent writes: IPC imports from other processes' GPUs.
+// Process-wide ledger of memory this process maps MTYPE_NC and that another
+// agent may write (see common/nc_ledger.h). All functions are no-ops while
+// acquire elision is off.
 
 // Adds [|base|, |base| + |size|) to the ledger.
-void iree_hal_streaming_nc_ledger_add(uint64_t base, uint64_t size);
+void iree_hal_streaming_nc_memory_track(
+    uint64_t base, uint64_t size, iree_hal_streaming_nc_range_kind_t kind);
 
 // Removes the range starting at |base|.
-void iree_hal_streaming_nc_ledger_remove(uint64_t base);
+void iree_hal_streaming_nc_memory_untrack(uint64_t base);
+
+// Tracks [|dst|, |dst| + |size|) as INDIRECT when the |src| bytes about to be
+// copied to it hold a pointer into the ledger.
+void iree_hal_streaming_nc_memory_note_host_to_device_copy(uint64_t dst,
+                                                           const void* src,
+                                                           uint64_t size);
+
+// Reports that another agent may now write memory this process maps NC.
+// |tracked| is true when every such range is in the ledger; an untracked
+// writer disables all elision. |reason| must be a literal.
+void iree_hal_streaming_nc_memory_note_foreign_writer(const char* reason,
+                                                      bool tracked);
 
 // Records a system-scope acquire ahead of the next dispatch in
-// |command_buffer| when HRX_ELIDE_ACQUIRE=2 and a naturally aligned 64-bit word
-// of |kernargs| points into the ledger. |kernel_name| is used for reporting.
+// |command_buffer| when acquire elision is on and a naturally aligned 64-bit
+// word of |kernargs| points into the ledger. |kernel_name| is used for
+// reporting.
 iree_status_t iree_hal_streaming_record_nc_acquire_if_needed(
     iree_hal_command_buffer_t* command_buffer, iree_const_byte_span_t kernargs,
     iree_string_view_t kernel_name);

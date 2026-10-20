@@ -79,6 +79,24 @@ iree_cc_library(
 
 iree_cc_library(
   NAME
+    nc_ledger
+  HDRS
+    "nc_ledger.h"
+  SRCS
+    "nc_ledger.c"
+  DEPS
+    iree::base
+    iree::base::internal
+    iree::base::threading
+    libhrx_defs
+  INCLUDES
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/..>"
+  PUBLIC
+)
+
+iree_cc_library(
+  NAME
     function_attributes
   HDRS
     "function_attributes.h"
@@ -153,6 +171,7 @@ iree_cc_library(
     ::capture_admission
     ::execution_resource
     ::function_attributes
+    ::nc_ledger
     iree::async
     iree::async::util::proactor_pool
     iree::base
@@ -174,6 +193,18 @@ iree_cc_library(
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../libhrx>"
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/../../libhrx>"
   PUBLIC
+)
+
+iree_cc_test(
+  NAME
+    nc_ledger_test
+  SRCS
+    "nc_ledger_test.cc"
+  DEPS
+    ::nc_ledger
+    iree::testing::gtest
+    iree::testing::gtest_main
+    libhrx_defs
 )
 
 iree_cc_test(
