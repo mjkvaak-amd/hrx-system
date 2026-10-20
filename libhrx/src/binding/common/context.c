@@ -25,7 +25,7 @@
 // Defined by the AMDGPU HAL driver when it is linked (aql_block_processor.h).
 __attribute__((weak)) void iree_hal_amdgpu_acquire_elision_note_foreign_writer(
     const char* reason, bool tracked);
-__attribute__((weak)) int iree_hal_amdgpu_acquire_elision_mode(void);
+__attribute__((weak)) bool iree_hal_amdgpu_acquire_elision_enabled(void);
 
 //===----------------------------------------------------------------------===//
 // NC ledger
@@ -56,8 +56,8 @@ void iree_hal_streaming_nc_memory_note_foreign_writer(const char* reason,
 }
 
 static void iree_hal_streaming_nc_memory_initialize(void) {
-  if (!iree_hal_amdgpu_acquire_elision_mode ||
-      iree_hal_amdgpu_acquire_elision_mode() == 0) {
+  if (!iree_hal_amdgpu_acquire_elision_enabled ||
+      !iree_hal_amdgpu_acquire_elision_enabled()) {
     return;
   }
   const char* report = getenv("HRX_ELIDE_ACQUIRE_REPORT");

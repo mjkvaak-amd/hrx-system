@@ -309,7 +309,7 @@ iree_status_t iree_hal_streaming_context_disable_peer_access(
     iree_hal_streaming_context_t* peer_context);
 
 //===----------------------------------------------------------------------===//
-// NC ledger (HRX_ELIDE_ACQUIRE=1,2)
+// NC ledger (HRX_ELIDE_ACQUIRE=1)
 //===----------------------------------------------------------------------===//
 
 // Process-wide ledger of memory this process maps MTYPE_NC and that another

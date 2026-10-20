@@ -144,28 +144,19 @@ iree_status_t iree_hal_amdgpu_aql_block_processor_invoke(
 // interior packet of an in-order submission follows its predecessor's agent
 // release, so its agent acquire is redundant unless another agent can write NC
 // memory that this agent may have cached between the two packets.
-typedef enum iree_hal_amdgpu_acquire_elision_mode_e {
-  // Every recorded acquire is emitted.
-  IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_OFF = 0,
-  // Interior agent acquires are elided until the process gains another GPU
-  // as a writer (peer access or an IPC import), and never when local VRAM is
-  // not mapped RW. Callers must still record a system-scope acquire on every
-  // dispatch that can reach CPU-written NC memory (host memory on gfx950).
-  IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_PROCESS = 1,
-  // Interior agent acquires are elided while every foreign writer is tracked.
-  // Callers must record a system-scope acquire on every dispatch that can
-  // observe tracked foreign NC writes; system-scope acquires are never elided.
-  IREE_HAL_AMDGPU_ACQUIRE_ELISION_MODE_DISPATCH = 2,
-} iree_hal_amdgpu_acquire_elision_mode_t;
+//
+// With HRX_ELIDE_ACQUIRE=1, interior agent acquires are elided while local
+// VRAM is mapped RW and every foreign writer is tracked. Callers must record a
+// system-scope acquire on every dispatch that can observe tracked foreign NC
+// writes (peer-written IPC memory, CPU-written host memory on gfx950);
+// system-scope acquires are never elided.
 
-// Returns the process-wide mode selected by HRX_ELIDE_ACQUIRE.
-iree_hal_amdgpu_acquire_elision_mode_t iree_hal_amdgpu_acquire_elision_mode(
-    void);
+// Returns true when HRX_ELIDE_ACQUIRE enables elision.
+bool iree_hal_amdgpu_acquire_elision_enabled(void);
 
 // Records that another agent may now write memory this process maps NC.
-// Permanently disables PROCESS-mode elision, and DISPATCH-mode elision too
-// unless |tracked| (the caller acquires before every dispatch that can reach
-// that memory). |reason| must be a literal.
+// Permanently disables elision unless |tracked| (the caller acquires before
+// every dispatch that can reach that memory). |reason| must be a literal.
 void iree_hal_amdgpu_acquire_elision_note_foreign_writer(const char* reason,
                                                          bool tracked);
 
